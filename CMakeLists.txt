@@ -25,6 +25,20 @@ endif()
 add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
 
 CPMAddPackage("gh:matcool/gd-imgui-cocos#main")
+
+# imgui-cocos was written for older Geode headers, so update its keyboard/IME signatures
+file(GLOB_RECURSE IMGUI_COCOS_FILES
+    "${gd-imgui-cocos_SOURCE_DIR}/*.hpp"
+    "${gd-imgui-cocos_SOURCE_DIR}/*.cpp")
+foreach(F ${IMGUI_COCOS_FILES})
+    file(READ "${F}" ORIG)
+    string(REGEX REPLACE "insertText\\(const char\\* *([A-Za-z_]*), *int *([A-Za-z_]*)\\)" "insertText(const char* \\1, int \\2, cocos2d::enumKeyCodes)" CONTENT "${ORIG}")
+    string(REGEX REPLACE "(keyDown|keyUp)\\((cocos2d::)?enumKeyCodes *([A-Za-z_]*)\\)" "\\1(\\2enumKeyCodes \\3, double)" CONTENT "${CONTENT}")
+    if(NOT "${CONTENT}" STREQUAL "${ORIG}")
+        file(WRITE "${F}" "${CONTENT}")
+    endif()
+endforeach()
+
 CPMAddPackage("gh:maxnut/GDReplayFormat#gdr2")
 target_link_libraries(${PROJECT_NAME} imgui-cocos libGDR)
 

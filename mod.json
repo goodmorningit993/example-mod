@@ -6,10 +6,10 @@
 		"mac": "2.2081",
 		"ios": "2.2081"
 	},
-	"id": "$MOD_ID",
-	"name": "$MOD_NAME",
+	"id": "oouushii.raptorbot",,
+	"name": "Raptor Bot",
 	"version": "$MOD_VERSION",
-	"developer": "$MOD_DEVELOPER",
+	"developer": "Unknown",
 	"description": "$MOD_DESCRIPTION",
 	"dependencies": {
 		"geode.node-ids": ">=v1.23.3"

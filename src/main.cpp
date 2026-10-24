@@ -448,9 +448,9 @@ $on_mod(Loaded) {
 
 // ----------------------------------------------------------------- hooks
 class $modify(RaptorBaseGameLayer, GJBaseGameLayer) {
-    void processCommands(float dt) {
-        Bot::get().beginStep(this);
-        GJBaseGameLayer::processCommands(dt);
+        void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+        if (!isHalfTick) Bot::get().beginStep(this);
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {

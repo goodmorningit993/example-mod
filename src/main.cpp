@@ -1,11 +1,9 @@
-// Raptor Bot - Liveplay assist for Geometry Dash (Geode)
+// Macro Studio - macro recorder / player for Geometry Dash (Geode)
 //
-// Liveplay: you play normally. When one of your clicks lands inside the early
-// buffer window of a click from the loaded .gdr2 replay, the click is put "on
-// probation" and a checkpoint is taken just before it is applied. If you die
-// while it is on probation, the death is cancelled, the game rewinds to that
-// checkpoint, your click is nullified and the replay's click is registered at
-// the replay's frame instead.
+// Press P to open or close the menu.
+//   Record : saves every click/release (both players, platformer buttons) per physics frame
+//   Play   : replays the macro by injecting those inputs on the exact frames
+// Macros are stored as .gdr2 files in the mod's config folder (macros/).
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -16,23 +14,25 @@
 #include <gdr/gdr.hpp>
 
 #include <algorithm>
-#include <deque>
-#include <optional>
+#include <cmath>
+#include <ctime>
+#include <string_view>
+#include <unordered_map>
 
 using namespace geode::prelude;
 
-// ---------------------------------------------------------------- keybinds
-static constexpr enumKeyCodes kKeyLiveplay = KEY_L;   // toggles Liveplay mode
-static constexpr enumKeyCodes kKeyMenu     = KEY_F8;  // shows / hides the window
+// ---------------------------------------------------------------- keybind
+static constexpr enumKeyCodes kKeyMenu = KEY_P;   // opens / closes the menu
 
-// ------------------------------------------------------------ replay types
-using RInput = gdr::Input<>;
+// ------------------------------------------------------------ macro types
+using MInput = gdr::Input<>;
 
-struct RaptorReplay : gdr::Replay<RaptorReplay, RInput> {
-    RaptorReplay() : Replay("Raptor Bot", 1) {}
+struct MacroReplay : gdr::Replay<MacroReplay, MInput> {
+    MacroReplay() : Replay("Macro Studio", 1) {}
 };
 
-enum class Mode { Disabled, Record, Playback, Liveplay };
+enum class Mode { Idle, Record, Play };
+enum class Tab { Macro, Settings, Library };
 
 struct Injection {
     uint64_t frame;
@@ -41,47 +41,42 @@ struct Injection {
     bool p1;
 };
 
-// A player click that was matched to a replay click and is being watched.
-struct Probation {
-    Ref<CheckpointObject> checkpoint; // state right before the click was applied
-    uint64_t clickFrame;              // frame the player clicked on
-    size_t replayIdx;                 // matched replay input
-    Injection substitute;             // the replay's click, used if the player's kills
-};
+// ------------------------------------------------------------------ colors
+static ImVec4 const kAccent(0.47f, 0.36f, 0.98f, 1.f);
+static ImVec4 const kRed(0.93f, 0.28f, 0.33f, 1.f);
+static ImVec4 const kGreen(0.20f, 0.78f, 0.52f, 1.f);
+static ImVec4 const kCard(0.14f, 0.15f, 0.19f, 1.f);
+static ImVec4 const kCardHover(0.20f, 0.21f, 0.27f, 1.f);
 
 // ------------------------------------------------------------------- state
-struct Bot {
-    // ---- UI settings (same order as the window)
-    Mode mode = Mode::Disabled;
-    bool ignorePlayerInputs = true;
-    bool hud = true;
-    bool markers = true;
-    bool releaseMarkers = true;
-    int  lookahead = 240;
-    bool assistClicks = true;
-    bool assistWindows = true;
-    int  earlyBuffer = 30;
-    bool smartNearest = true;
-    char path[512] = {};
+struct Studio {
+    Mode mode = Mode::Idle;
+    Tab tab = Tab::Macro;
+    bool menuOpen = false;
+
+    // settings (saved between sessions)
+    bool autoSave = true;
+    bool practiceFix = true;
+    bool ignoreInput = true;
+    bool overlay = true;
+    bool overlayDetails = true;
+    bool notify = true;
+    float speed = 1.f;
+
+    // runtime
+    MacroReplay macro;
+    char name[128] = "macro";
     std::string status = "Ready";
-    bool menuOpen = true;
-
-    // ---- runtime
-    RaptorReplay replay;
-    std::vector<int64_t> consumedAt;   // per replay input: frame it was matched on, -1 = free
-    std::deque<Probation> probation;
-    std::vector<Injection> queue;
-    std::optional<Probation> rewind;
+    std::vector<std::filesystem::path> files;
+    int selected = -1;
+    bool needRefresh = true;
+    bool deleteArmed = false;
     bool injecting = false;
-    int assisted = 0;
+    std::unordered_map<CheckpointObject*, uint64_t> cpFrames;
 
-    // A click stays on probation until its replay frame + this many frames.
-    static constexpr uint64_t kSettleFrames = 30;
-    static constexpr size_t kMaxProbation = 8;
-
-    static Bot& get() {
-        static Bot b;
-        return b;
+    static Studio& get() {
+        static Studio s;
+        return s;
     }
 
     // ------------------------------------------------------------ helpers
@@ -96,401 +91,571 @@ struct Bot {
         return pl && static_cast<GJBaseGameLayer*>(pl) == gl;
     }
 
-    void sync() { consumedAt.resize(replay.inputs.size(), -1); }
+    static std::string clean(std::string s) {
+        for (auto& ch : s) {
+            if (std::string_view("\\/:*?\"<>|").find(ch) != std::string_view::npos) ch = '_';
+        }
+        if (s.empty()) s = "macro";
+        return s;
+    }
 
-    char const* modeName() const {
-        switch (mode) {
-            case Mode::Record:   return "Record";
-            case Mode::Playback: return "Playback";
-            case Mode::Liveplay: return "Liveplay";
-            default:             return "Disabled";
+    std::filesystem::path dir() const {
+        auto d = Mod::get()->getConfigDir() / "macros";
+        std::error_code ec;
+        std::filesystem::create_directories(d, ec);
+        return d;
+    }
+
+    void toast(std::string const& msg) const {
+        if (notify) Notification::create(msg, NotificationIcon::Success, 0.8f)->show();
+    }
+
+    void applySpeed() {
+        speed = std::clamp(speed, 0.05f, 2.f);
+        CCDirector::get()->getScheduler()->setTimeScale(speed);
+    }
+
+    float lengthSeconds() const {
+        if (macro.inputs.empty() || macro.framerate <= 0) return 0.f;
+        return static_cast<float>(macro.inputs.back().frame / macro.framerate);
+    }
+
+    // ----------------------------------------------------------- settings
+    void loadSettings() {
+        auto* m = Mod::get();
+        autoSave = m->getSavedValue<bool>("auto-save", true);
+        practiceFix = m->getSavedValue<bool>("practice-fix", true);
+        ignoreInput = m->getSavedValue<bool>("ignore-input", true);
+        overlay = m->getSavedValue<bool>("overlay", true);
+        overlayDetails = m->getSavedValue<bool>("overlay-details", true);
+        notify = m->getSavedValue<bool>("notify", true);
+        speed = m->getSavedValue<float>("speed", 1.f);
+        applySpeed();
+    }
+
+    void saveSettings() {
+        auto* m = Mod::get();
+        m->setSavedValue("auto-save", autoSave);
+        m->setSavedValue("practice-fix", practiceFix);
+        m->setSavedValue("ignore-input", ignoreInput);
+        m->setSavedValue("overlay", overlay);
+        m->setSavedValue("overlay-details", overlayDetails);
+        m->setSavedValue("notify", notify);
+        m->setSavedValue("speed", speed);
+    }
+
+    void resetSettings() {
+        autoSave = practiceFix = ignoreInput = overlay = overlayDetails = notify = true;
+        speed = 1.f;
+        applySpeed();
+    }
+
+    // ------------------------------------------------------- file handling
+    void fillMeta() {
+        auto& in = macro.inputs;
+        std::stable_sort(in.begin(), in.end(), [](MInput const& a, MInput const& b) { return a.frame < b.frame; });
+        macro.duration = lengthSeconds();
+        macro.gameVersion = GEODE_COMP_GD_VERSION;
+        macro.author = std::string(GJAccountManager::get()->m_username);
+        if (auto* pl = PlayLayer::get()) {
+            macro.platformer = pl->m_levelSettings->m_platformerMode;
+            macro.levelInfo.id = static_cast<uint32_t>(pl->m_level->m_levelID.value());
+            macro.levelInfo.name = std::string(pl->m_level->m_levelName);
         }
     }
 
-    std::string nextText() {
-        sync();
-        auto const& in = replay.inputs;
-        auto cur = frame();
-        auto it = std::lower_bound(in.begin(), in.end(), cur,
-            [](RInput const& a, uint64_t v) { return a.frame < v; });
-        for (size_t i = it - in.begin(); i < in.size(); ++i) {
-            if (mode == Mode::Liveplay && consumedAt[i] >= 0) continue;
-            return fmt::format("{} {} (+{})", in[i].frame, in[i].down ? "down" : "up", in[i].frame - cur);
+    bool saveTo(std::filesystem::path const& p) {
+        fillMeta();
+        auto data = macro.exportData();
+        if (data.isErr()) {
+            status = "Save failed: " + data.unwrapErr();
+            return false;
         }
-        return "none";
-    }
-
-    void clearRun() {
-        queue.clear();
-        probation.clear();
-        rewind.reset();
-    }
-
-    void resetRun() {
-        sync();
-        clearRun();
-        auto f = static_cast<int64_t>(frame());
-        for (auto& c : consumedAt) if (c >= f) c = -1;
-    }
-
-    void setMode(Mode m) {
-        mode = m;
-        assisted = 0;
-        resetRun();
-        status = (m == Mode::Record) ? "Recording: press Restart to start a fresh take" : "Ready";
-    }
-
-    void inject(GJBaseGameLayer* gl, Injection const& i) {
-        injecting = true;
-        gl->handleButton(i.down, i.button, i.p1);
-        injecting = false;
-    }
-
-    // ------------------------------------------------------- liveplay core
-    // Finds the replay input a player click should be paired with.
-    std::optional<size_t> findMatch(uint64_t f, bool down, int button, bool p1) {
-        auto const& in = replay.inputs;
-        auto it = std::lower_bound(in.begin(), in.end(), f,
-            [](RInput const& a, uint64_t v) { return a.frame < v; });
-        for (size_t i = it - in.begin(); i < in.size(); ++i) {
-            if (consumedAt[i] >= 0) continue;
-            if (in[i].frame > f + static_cast<uint64_t>(earlyBuffer)) break;
-            if (in[i].down == down && in[i].button == button && in[i].player2 == !p1) return i;
-            // Smart nearest: skip inputs of another type and keep looking inside the
-            // window. Otherwise only the very next free input may be matched.
-            if (!smartNearest) break;
+        auto w = utils::file::writeBinary(p, data.unwrap());
+        if (w.isErr()) {
+            status = "Save failed: " + w.unwrapErr();
+            return false;
         }
-        return std::nullopt;
-    }
-
-    void trackClick(PlayLayer* pl, bool down, int button, bool p1) {
-        auto f = frame();
-        auto idx = findMatch(f, down, button, p1);
-        if (!idx) return;
-
-        auto const& in = replay.inputs[*idx];
-        consumedAt[*idx] = static_cast<int64_t>(f);
-        if (in.frame == f) return; // already on the replay's frame, nothing to fix
-
-        auto* cp = pl->createCheckpoint(); // taken BEFORE the click is applied
-        if (!cp) return;
-        probation.push_back(Probation{
-            Ref<CheckpointObject>(cp), f, *idx, Injection{ in.frame, down, button, p1 }
-        });
-        if (probation.size() > kMaxProbation) probation.pop_front();
-    }
-
-    // Called from the GJBaseGameLayer::handleButton hook. false = drop the input.
-    bool onPlayerInput(GJBaseGameLayer* gl, bool down, int button, bool p1) {
-        if (injecting || !isPlayLayer(gl)) return true;
-        auto* pl = PlayLayer::get();
-        sync();
-        switch (mode) {
-            case Mode::Playback:
-                return !ignorePlayerInputs;
-            case Mode::Record:
-                replay.inputs.emplace_back(frame(), static_cast<uint8_t>(button), !p1, down);
-                return true;
-            case Mode::Liveplay:
-                if (assistClicks) trackClick(pl, down, button, p1);
-                return true;
-            default:
-                return true;
-        }
-    }
-
-    // Called from the PlayLayer::destroyPlayer hook. true = swallow the death.
-    bool tryRescue(PlayLayer* pl, GameObject* obj) {
-        if (mode != Mode::Liveplay || !assistClicks) return false;
-        if (obj && obj == pl->m_anticheatSpike) return false;
-        if (rewind) return true;            // already rewinding, ignore extra hits
-        if (probation.empty()) return false; // nothing to blame, die normally
-        rewind = std::move(probation.back()); // blame the most recent click
-        probation.pop_back();
         return true;
     }
 
-    void performRewind(PlayLayer* pl) {
-        auto p = std::move(*rewind);
-        rewind.reset();
-
-        pl->loadFromCheckpoint(p.checkpoint);
-        pl->m_gameState.m_currentProgress = static_cast<int>(p.clickFrame);
-
-        // The timeline after the click was overwritten: forget everything matched after it.
-        for (auto& c : consumedAt) if (c >= static_cast<int64_t>(p.clickFrame)) c = -1;
-        if (p.replayIdx < consumedAt.size()) consumedAt[p.replayIdx] = static_cast<int64_t>(p.clickFrame);
-        std::erase_if(probation, [&](Probation const& o) { return o.clickFrame >= p.clickFrame; });
-
-        queue.clear();
-        queue.push_back(p.substitute); // the passable click, fired on the replay's frame
-        ++assisted;
-        status = fmt::format("Fixed click: frame {} -> {}", p.clickFrame, p.substitute.frame);
-    }
-
-    // Called at the start of every physics step.
-    void beginStep(GJBaseGameLayer* gl) {
-        if (mode == Mode::Disabled || mode == Mode::Record || !isPlayLayer(gl)) return;
-        auto* pl = PlayLayer::get();
-        sync();
-
-        if (rewind) performRewind(pl);
-        auto f = frame();
-
-        if (mode == Mode::Liveplay) {
-            std::erase_if(probation, [&](Probation const& p) {
-                return f > p.substitute.frame + kSettleFrames;
-            });
-            for (size_t i = 0; i < queue.size();) {
-                if (queue[i].frame <= f) {
-                    auto inj = queue[i];
-                    queue.erase(queue.begin() + i);
-                    inject(gl, inj);
-                } else ++i;
-            }
-        } else { // Playback
-            auto& in = replay.inputs;
-            auto it = std::lower_bound(in.begin(), in.end(), f,
-                [](RInput const& a, uint64_t v) { return a.frame < v; });
-            for (; it != in.end() && it->frame == f; ++it) {
-                inject(gl, Injection{ f, it->down, static_cast<int>(it->button), !it->player2 });
-            }
-        }
-    }
-
-    void onLevelReset(PlayLayer* pl) {
-        if (mode == Mode::Record && !pl->m_isPracticeMode) replay.inputs.clear();
-        resetRun();
-    }
-
-    // ----------------------------------------------------------- buttons
-    void applyAssistProfile() {
-        assistClicks = assistWindows = smartNearest = true;
-        hud = markers = releaseMarkers = true;
-        lookahead = 240;
-        earlyBuffer = 30;
-        status = "Liveplay assist profile applied";
-    }
-
-    void newClear() {
-        replay = RaptorReplay();
-        consumedAt.clear();
-        resetRun();
-        status = "Replay cleared";
-    }
-
     void save() {
-        auto& in = replay.inputs;
-        std::stable_sort(in.begin(), in.end(), [](RInput const& a, RInput const& b) { return a.frame < b.frame; });
-        replay.duration = in.empty() ? 0.f : static_cast<float>(in.back().frame / replay.framerate);
-        replay.gameVersion = GEODE_COMP_GD_VERSION;
-        replay.author = std::string(GJAccountManager::get()->m_username);
-        if (auto* pl = PlayLayer::get()) {
-            replay.platformer = pl->m_levelSettings->m_platformerMode;
-            replay.levelInfo.id = static_cast<uint32_t>(pl->m_level->m_levelID.value());
-            replay.levelInfo.name = std::string(pl->m_level->m_levelName);
+        if (macro.inputs.empty()) {
+            status = "Nothing to save yet";
+            return;
         }
-
-        auto data = replay.exportData();
-        if (data.isErr()) { status = "Save failed: " + data.unwrapErr(); return; }
-
-        std::filesystem::path p = path;
-        std::error_code ec;
-        std::filesystem::create_directories(p.parent_path(), ec);
-        auto w = utils::file::writeBinary(p, data.unwrap());
-        status = w.isOk() ? fmt::format("Saved {} inputs", in.size()) : "Save failed: " + w.unwrapErr();
+        auto p = dir() / (clean(name) + ".gdr2");
+        if (saveTo(p)) {
+            status = fmt::format("Saved {} inputs to {}", macro.inputs.size(), p.filename().string());
+            needRefresh = true;
+        }
     }
 
-    void load() {
-        auto bytes = utils::file::readBinary(std::filesystem::path(path));
-        if (bytes.isErr()) { status = "Load failed: " + bytes.unwrapErr(); return; }
+    void load(std::filesystem::path const& p) {
+        auto bytes = utils::file::readBinary(p);
+        if (bytes.isErr()) {
+            status = "Load failed: " + bytes.unwrapErr();
+            return;
+        }
+        auto r = MacroReplay::importData(bytes.unwrap());
+        if (r.isErr()) {
+            status = "Load failed: " + r.unwrapErr();
+            return;
+        }
+        macro = r.unwrap();
+        // GDR2 stores P1 inputs then P2 inputs, so sort after importing.
+        std::stable_sort(macro.inputs.begin(), macro.inputs.end(),
+            [](MInput const& a, MInput const& b) { return a.frame < b.frame; });
+        std::snprintf(name, sizeof(name), "%s", p.stem().string().c_str());
+        status = fmt::format("Loaded {} inputs", macro.inputs.size());
+    }
 
-        auto r = RaptorReplay::importData(bytes.unwrap());
-        if (r.isErr()) { status = "Load failed: " + r.unwrapErr(); return; }
+    void refresh() {
+        files.clear();
+        std::error_code ec;
+        for (auto const& e : std::filesystem::directory_iterator(dir(), ec)) {
+            if (e.is_regular_file() && e.path().extension() == ".gdr2") files.push_back(e.path());
+        }
+        std::sort(files.begin(), files.end());
+        selected = -1;
+        deleteArmed = false;
+        needRefresh = false;
+    }
 
-        replay = r.unwrap();
-        // GDR2 stores P1 inputs then P2 inputs, so sorting after import is required.
-        std::stable_sort(replay.inputs.begin(), replay.inputs.end(),
-            [](RInput const& a, RInput const& b) { return a.frame < b.frame; });
-        consumedAt.assign(replay.inputs.size(), -1);
-        resetRun();
-        status = fmt::format("Loaded {} inputs", replay.inputs.size());
+    std::string autoName() const {
+        std::string lvl = "macro";
+        if (auto* pl = PlayLayer::get()) lvl = std::string(pl->m_level->m_levelName);
+        std::time_t t = std::time(nullptr);
+        std::tm tm{};
+#ifdef GEODE_IS_WINDOWS
+        localtime_s(&tm, &t);
+#else
+        localtime_r(&t, &tm);
+#endif
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
+        return clean(lvl) + "_" + buf;
+    }
+
+    void clearMacro() {
+        macro = MacroReplay();
+        status = "Macro cleared";
     }
 
     void restart() {
         if (auto* pl = PlayLayer::get()) pl->resetLevel();
         else status = "Open a level first";
     }
-};
 
-// -------------------------------------------------------------------- UI
-static void drawWindow() {
-    auto& b = Bot::get();
-
-    ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(365, 455), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("Raptor Bot")) { ImGui::End(); return; }
-
-    int m = static_cast<int>(b.mode);
-    bool changed = false;
-    changed |= ImGui::RadioButton("Disabled", &m, 0); ImGui::SameLine();
-    changed |= ImGui::RadioButton("Record",   &m, 1); ImGui::SameLine();
-    changed |= ImGui::RadioButton("Playback", &m, 2); ImGui::SameLine();
-    changed |= ImGui::RadioButton("Liveplay", &m, 3);
-    if (changed) b.setMode(static_cast<Mode>(m));
-
-    ImGui::Text("State: %s", b.modeName());
-    ImGui::Text("Frame: %llu", static_cast<unsigned long long>(b.frame()));
-    ImGui::Text("Inputs: %zu", b.replay.inputs.size());
-    ImGui::Text("Replay FPS: %.3f", b.replay.framerate);
-    ImGui::Text("Next: %s", b.nextText().c_str());
-    ImGui::Text("Queued: %zu", b.queue.size());
-
-    if (ImGui::Button("Liveplay assist profile")) b.applyAssistProfile();
-    ImGui::SameLine();
-    if (ImGui::Button("Clear queue")) { b.queue.clear(); b.probation.clear(); }
-
-    ImGui::Checkbox("Ignore player inputs during playback", &b.ignorePlayerInputs);
-    ImGui::Checkbox("Liveplay HUD", &b.hud);
-    ImGui::Checkbox("Render replay markers", &b.markers);
-    ImGui::Checkbox("Show release markers", &b.releaseMarkers);
-    ImGui::SliderInt("Marker lookahead", &b.lookahead, 1, 960, "%d frames");
-    ImGui::Checkbox("Assist clicks in liveplay", &b.assistClicks);
-    ImGui::Checkbox("Render assist windows", &b.assistWindows);
-    ImGui::SliderInt("Early buffer window", &b.earlyBuffer, 0, 60, "%d frames");
-    ImGui::Checkbox("Smart nearest windows", &b.smartNearest);
-
-    ImGui::Separator();
-    ImGui::InputText("Replay path", b.path, sizeof(b.path));
-    if (ImGui::Button("New/Clear")) b.newClear();
-    ImGui::SameLine();
-    if (ImGui::Button("Save")) b.save();
-    ImGui::SameLine();
-    if (ImGui::Button("Load")) b.load();
-    ImGui::SameLine();
-    if (ImGui::Button("Restart")) b.restart();
-
-    ImGui::Separator();
-    ImGui::TextUnformatted(b.status.c_str());
-
-    ImGui::End();
-}
-
-// Timeline along the bottom of the screen: "now" on the left, upcoming replay
-// inputs to the right, shaded boxes = the early buffer window of each input.
-static void drawHud() {
-    auto& b = Bot::get();
-    if (!PlayLayer::get()) return;
-    if (b.mode != Mode::Liveplay && b.mode != Mode::Playback) return;
-    b.sync();
-
-    bool live = b.mode == Mode::Liveplay;
-    auto const& in = b.replay.inputs;
-    uint64_t cur = b.frame();
-    uint64_t span = static_cast<uint64_t>(std::max(b.lookahead, 1));
-
-    ImVec2 ds = ImGui::GetIO().DisplaySize;
-    float w = ds.x * 0.5f;
-    float x0 = (ds.x - w) * 0.5f;
-    float y = ds.y - 60.f;
-    auto* dl = ImGui::GetBackgroundDrawList();
-
-    auto xOf = [&](uint64_t f) { return x0 + w * static_cast<float>(f - cur) / static_cast<float>(span); };
-
-    if (b.markers || (live && b.assistWindows)) {
-        dl->AddRectFilled(ImVec2(x0 - 4, y - 14), ImVec2(x0 + w + 4, y + 14), IM_COL32(0, 0, 0, 110), 4.f);
-        dl->AddLine(ImVec2(x0, y - 16), ImVec2(x0, y + 16), IM_COL32(255, 255, 255, 255), 2.f);
-
-        auto it = std::lower_bound(in.begin(), in.end(), cur,
-            [](RInput const& a, uint64_t v) { return a.frame < v; });
-        for (; it != in.end() && it->frame <= cur + span; ++it) {
-            size_t i = it - in.begin();
-            if (!it->down && !b.releaseMarkers) continue;
-
-            bool used = live && b.consumedAt[i] >= 0;
-            float x = xOf(it->frame);
-
-            if (live && b.assistWindows && !used) {
-                uint64_t early = static_cast<uint64_t>(b.earlyBuffer);
-                uint64_t ws = std::max<uint64_t>(it->frame >= early ? it->frame - early : 0, cur);
-                dl->AddRectFilled(ImVec2(xOf(ws), y - 10), ImVec2(x, y + 10),
-                    it->down ? IM_COL32(80, 255, 120, 55) : IM_COL32(255, 170, 60, 55));
+    // ----------------------------------------------------------- modes
+    void finishRecording() {
+        if (macro.inputs.empty()) {
+            status = "Nothing was recorded";
+            return;
+        }
+        fillMeta();
+        if (autoSave) {
+            auto p = dir() / (autoName() + ".gdr2");
+            if (saveTo(p)) {
+                status = "Recording saved: " + p.filename().string();
+                needRefresh = true;
             }
-            if (b.markers) {
-                ImU32 col = used ? IM_COL32(130, 130, 130, 200)
-                          : it->down ? IM_COL32(80, 255, 120, 255) : IM_COL32(255, 170, 60, 255);
-                float h = it->down ? 14.f : 9.f;
-                dl->AddLine(ImVec2(x, y - h), ImVec2(x, y + h), col, 2.f);
-            }
+        } else {
+            status = fmt::format("Recorded {} inputs (press Save to keep it)", macro.inputs.size());
         }
     }
 
-    if (live && b.hud) {
-        auto txt = fmt::format("LIVEPLAY  frame {}  next {}  queued {}  fixed {}{}",
-            cur, b.nextText(), b.queue.size(), b.assisted,
-            b.probation.empty() ? "" : "  [watching click]");
-        dl->AddText(ImVec2(x0, y - 40), IM_COL32(255, 255, 255, 230), txt.c_str());
+    void setMode(Mode m) {
+        if (m == mode) m = Mode::Idle; // clicking the active mode turns it off
+        bool wasRecording = mode == Mode::Record && m != Mode::Record;
+        if (wasRecording) finishRecording();
+
+        if (m == Mode::Play && macro.inputs.empty()) {
+            status = "Load or record a macro first";
+            mode = Mode::Idle;
+            return;
+        }
+
+        mode = m;
+        if (m == Mode::Record) {
+            macro.inputs.clear();
+            status = "Recording from the start of the level";
+            toast("Recording");
+            restart();
+        } else if (m == Mode::Play) {
+            status = "Playing macro";
+            toast("Playing");
+            restart();
+        } else if (!wasRecording) {
+            status = "Ready";
+        }
+    }
+
+    // --------------------------------------------------- game-side events
+    // Returns false to drop the input.
+    bool onInput(GJBaseGameLayer* gl, bool down, int button, bool p1) {
+        if (injecting || !isPlayLayer(gl)) return true;
+        if (mode == Mode::Play) return !ignoreInput;
+        if (mode == Mode::Record) {
+            macro.inputs.emplace_back(frame(), static_cast<uint8_t>(button), !p1, down);
+        }
+        return true;
+    }
+
+    // Called at the start of every physics step.
+    void beginStep(GJBaseGameLayer* gl) {
+        if (mode != Mode::Play || !isPlayLayer(gl)) return;
+        auto f = frame();
+        auto& in = macro.inputs;
+        auto it = std::lower_bound(in.begin(), in.end(), f,
+            [](MInput const& a, uint64_t v) { return a.frame < v; });
+        for (; it != in.end() && it->frame == f; ++it) {
+            Injection inj{ f, it->down, static_cast<int>(it->button), !it->player2 };
+            injecting = true;
+            gl->handleButton(inj.down, inj.button, inj.p1);
+            injecting = false;
+        }
+    }
+
+    void onLevelReset(PlayLayer* pl) {
+        // A restart from the very beginning means a fresh attempt.
+        if (!pl->m_isPracticeMode || frame() == 0) {
+            cpFrames.clear();
+            if (mode == Mode::Record) macro.inputs.clear();
+        }
+    }
+
+    void onCheckpoint(CheckpointObject* cp) {
+        if (cp) cpFrames[cp] = frame();
+    }
+
+    // Practice fix: going back to a checkpoint throws away inputs recorded after it.
+    void onCheckpointLoad(CheckpointObject* cp) {
+        if (mode != Mode::Record || !practiceFix) return;
+        auto it = cpFrames.find(cp);
+        if (it == cpFrames.end()) return;
+        auto f = it->second;
+        std::erase_if(macro.inputs, [&](MInput const& i) { return i.frame >= f; });
+    }
+
+    void onComplete() {
+        if (mode != Mode::Record) return;
+        finishRecording();
+        mode = Mode::Idle;
+        toast("Recording finished");
+    }
+
+    void onQuit() {
+        if (mode == Mode::Record) {
+            finishRecording();
+            mode = Mode::Idle;
+        }
+        cpFrames.clear();
+    }
+};
+
+// -------------------------------------------------------------- UI styling
+static void applyStyle() {
+    ImGuiStyle& st = ImGui::GetStyle();
+    st.WindowRounding = 14.f;
+    st.ChildRounding = 10.f;
+    st.FrameRounding = 8.f;
+    st.PopupRounding = 8.f;
+    st.GrabRounding = 8.f;
+    st.ScrollbarRounding = 8.f;
+    st.WindowPadding = ImVec2(16.f, 14.f);
+    st.FramePadding = ImVec2(10.f, 7.f);
+    st.ItemSpacing = ImVec2(10.f, 9.f);
+    st.WindowBorderSize = 1.f;
+    st.FrameBorderSize = 0.f;
+    st.WindowTitleAlign = ImVec2(0.5f, 0.5f);
+
+    ImVec4* c = st.Colors;
+    c[ImGuiCol_Text] = ImVec4(0.93f, 0.94f, 0.97f, 1.f);
+    c[ImGuiCol_TextDisabled] = ImVec4(0.55f, 0.57f, 0.64f, 1.f);
+    c[ImGuiCol_WindowBg] = ImVec4(0.075f, 0.080f, 0.100f, 0.97f);
+    c[ImGuiCol_PopupBg] = ImVec4(0.09f, 0.095f, 0.12f, 0.98f);
+    c[ImGuiCol_Border] = ImVec4(1.f, 1.f, 1.f, 0.07f);
+    c[ImGuiCol_FrameBg] = kCard;
+    c[ImGuiCol_FrameBgHovered] = kCardHover;
+    c[ImGuiCol_FrameBgActive] = kCardHover;
+    c[ImGuiCol_TitleBg] = ImVec4(0.075f, 0.080f, 0.100f, 1.f);
+    c[ImGuiCol_TitleBgActive] = ImVec4(0.075f, 0.080f, 0.100f, 1.f);
+    c[ImGuiCol_TitleBgCollapsed] = ImVec4(0.075f, 0.080f, 0.100f, 1.f);
+    c[ImGuiCol_Button] = kCard;
+    c[ImGuiCol_ButtonHovered] = kCardHover;
+    c[ImGuiCol_ButtonActive] = kAccent;
+    c[ImGuiCol_CheckMark] = kAccent;
+    c[ImGuiCol_SliderGrab] = kAccent;
+    c[ImGuiCol_SliderGrabActive] = ImVec4(0.60f, 0.50f, 1.f, 1.f);
+    c[ImGuiCol_Header] = ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.30f);
+    c[ImGuiCol_HeaderHovered] = ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.50f);
+    c[ImGuiCol_HeaderActive] = ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.70f);
+    c[ImGuiCol_Separator] = ImVec4(1.f, 1.f, 1.f, 0.08f);
+    c[ImGuiCol_ScrollbarBg] = ImVec4(0.f, 0.f, 0.f, 0.f);
+    c[ImGuiCol_ScrollbarGrab] = ImVec4(1.f, 1.f, 1.f, 0.15f);
+}
+
+// -------------------------------------------------------------- UI helpers
+static void tip(char const* text) {
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", text);
+}
+
+static bool coloredButton(char const* label, bool active, ImVec4 const& col, ImVec2 size) {
+    ImGui::PushStyleColor(ImGuiCol_Button, active ? col : kCard);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, active ? col : kCardHover);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, col);
+    bool pressed = ImGui::Button(label, size);
+    ImGui::PopStyleColor(3);
+    return pressed;
+}
+
+static void tabButton(char const* label, Tab t, float w) {
+    auto& s = Studio::get();
+    if (coloredButton(label, s.tab == t, kAccent, ImVec2(w, 32.f))) s.tab = t;
+}
+
+static void stat(char const* label, std::string const& value) {
+    ImGui::TableNextColumn();
+    ImGui::TextDisabled("%s", label);
+    ImGui::TextUnformatted(value.c_str());
+}
+
+// ----------------------------------------------------------------- tabs
+static void drawMacroTab() {
+    auto& s = Studio::get();
+    float gap = ImGui::GetStyle().ItemSpacing.x;
+    float w3 = (ImGui::GetContentRegionAvail().x - gap * 2.f) / 3.f;
+    float w2 = (ImGui::GetContentRegionAvail().x - gap) / 2.f;
+
+    if (coloredButton("Idle", s.mode == Mode::Idle, kAccent, ImVec2(w3, 44.f))) s.setMode(Mode::Idle);
+    ImGui::SameLine();
+    if (coloredButton("Record", s.mode == Mode::Record, kRed, ImVec2(w3, 44.f))) s.setMode(Mode::Record);
+    ImGui::SameLine();
+    if (coloredButton("Play", s.mode == Mode::Play, kGreen, ImVec2(w3, 44.f))) s.setMode(Mode::Play);
+
+    ImGui::Spacing();
+    if (ImGui::BeginTable("stats", 4)) {
+        stat("Frame", fmt::format("{}", s.frame()));
+        stat("Inputs", fmt::format("{}", s.macro.inputs.size()));
+        stat("FPS", fmt::format("{:.0f}", s.macro.framerate));
+        stat("Length", fmt::format("{:.1f}s", s.lengthSeconds()));
+        ImGui::EndTable();
+    }
+
+    ImGui::Separator();
+    if (ImGui::Button("Restart level", ImVec2(-1.f, 36.f))) s.restart();
+    tip("Starts the level over from frame 0");
+
+    ImGui::InputText("Name", s.name, sizeof(s.name));
+    if (ImGui::Button("Save", ImVec2(w2, 34.f))) s.save();
+    ImGui::SameLine();
+    if (ImGui::Button("Clear", ImVec2(w2, 34.f))) s.clearMacro();
+
+    if (s.macro.inputs.empty()) {
+        ImGui::Spacing();
+        ImGui::TextDisabled("No macro loaded. Record one, or open the Library tab.");
     }
 }
 
-$on_mod(Loaded) {
-    auto& b = Bot::get();
-    auto def = (Mod::get()->getConfigDir() / "replay.gdr2").string();
-    std::snprintf(b.path, sizeof(b.path), "%s", def.c_str());
+static void drawSettingsTab() {
+    auto& s = Studio::get();
 
+    ImGui::SeparatorText("Recording");
+    ImGui::Checkbox("Auto-save recordings", &s.autoSave);
+    tip("Saves the macro by itself when recording ends");
+    ImGui::Checkbox("Practice mode fix", &s.practiceFix);
+    tip("Drops inputs recorded after a checkpoint when you respawn on it (basic)");
+
+    ImGui::SeparatorText("Playback");
+    ImGui::Checkbox("Ignore my clicks while playing", &s.ignoreInput);
+    tip("Blocks your own inputs while a macro is playing");
+
+    ImGui::SeparatorText("Speed");
+    if (ImGui::SliderFloat("Speed", &s.speed, 0.05f, 2.f, "%.2fx")) s.applySpeed();
+    tip("Game speed. Slow speeds make hard sections easier to record");
+    if (ImGui::Button("Reset speed")) {
+        s.speed = 1.f;
+        s.applySpeed();
+    }
+
+    ImGui::SeparatorText("Display");
+    ImGui::Checkbox("Status overlay", &s.overlay);
+    ImGui::Checkbox("Overlay details", &s.overlayDetails);
+    tip("Shows the frame number in the overlay");
+    ImGui::Checkbox("Notifications", &s.notify);
+
+    ImGui::Spacing();
+    if (ImGui::Button("Reset all settings", ImVec2(-1.f, 34.f))) s.resetSettings();
+}
+
+static void drawLibraryTab() {
+    auto& s = Studio::get();
+    if (s.needRefresh) s.refresh();
+
+    float gap = ImGui::GetStyle().ItemSpacing.x;
+    float w2 = (ImGui::GetContentRegionAvail().x - gap) / 2.f;
+    if (ImGui::Button("Refresh", ImVec2(w2, 32.f))) s.refresh();
+    ImGui::SameLine();
+    if (ImGui::Button("Open folder", ImVec2(w2, 32.f))) utils::file::openFolder(s.dir());
+
+    ImGui::BeginChild("files", ImVec2(0.f, 230.f), true);
+    if (s.files.empty()) ImGui::TextDisabled("No macros saved yet.");
+    for (int i = 0; i < static_cast<int>(s.files.size()); ++i) {
+        auto label = fmt::format("{}##{}", s.files[i].stem().string(), i);
+        if (ImGui::Selectable(label.c_str(), s.selected == i)) {
+            s.selected = i;
+            s.deleteArmed = false;
+        }
+    }
+    ImGui::EndChild();
+
+    bool has = s.selected >= 0 && s.selected < static_cast<int>(s.files.size());
+    if (ImGui::Button("Load", ImVec2(w2, 34.f)) && has) s.load(s.files[s.selected]);
+    ImGui::SameLine();
+    if (ImGui::Button(s.deleteArmed ? "Confirm delete" : "Delete", ImVec2(w2, 34.f)) && has) {
+        if (!s.deleteArmed) {
+            s.deleteArmed = true;
+        } else {
+            std::error_code ec;
+            std::filesystem::remove(s.files[s.selected], ec);
+            s.status = ec ? "Delete failed" : "Macro deleted";
+            s.refresh();
+        }
+    }
+}
+
+static void drawWindow() {
+    auto& s = Studio::get();
+
+    ImGui::SetNextWindowPos(ImVec2(40.f, 40.f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(400.f, 500.f), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Macro Studio", nullptr, ImGuiWindowFlags_NoCollapse)) {
+        ImGui::End();
+        return;
+    }
+
+    float gap = ImGui::GetStyle().ItemSpacing.x;
+    float w3 = (ImGui::GetContentRegionAvail().x - gap * 2.f) / 3.f;
+    tabButton("Macro", Tab::Macro, w3);
+    ImGui::SameLine();
+    tabButton("Settings", Tab::Settings, w3);
+    ImGui::SameLine();
+    tabButton("Library", Tab::Library, w3);
+    ImGui::Spacing();
+
+    switch (s.tab) {
+        case Tab::Macro: drawMacroTab(); break;
+        case Tab::Settings: drawSettingsTab(); break;
+        case Tab::Library: drawLibraryTab(); break;
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled("%s", s.status.c_str());
+    ImGui::End();
+}
+
+// Small pill at the top of the screen while recording / playing.
+static void drawOverlay() {
+    auto& s = Studio::get();
+    if (!s.overlay || !PlayLayer::get()) return;
+
+    bool rec = s.mode == Mode::Record;
+    bool play = s.mode == Mode::Play;
+    bool sped = std::abs(s.speed - 1.f) > 0.001f;
+    if (!rec && !play && !sped) return;
+
+    std::string txt = rec ? "REC" : (play ? "PLAY" : "");
+    if (s.overlayDetails && (rec || play)) txt += fmt::format("   F {}", s.frame());
+    if (sped) txt += fmt::format("{}{:.2f}x", txt.empty() ? "" : "   ", s.speed);
+
+    ImVec2 ts = ImGui::CalcTextSize(txt.c_str());
+    ImVec2 ds = ImGui::GetIO().DisplaySize;
+    float padX = 14.f, padY = 7.f;
+    float dot = (rec || play) ? 18.f : 0.f;
+    float w = ts.x + padX * 2.f + dot;
+    float h = ts.y + padY * 2.f;
+    ImVec2 p0((ds.x - w) * 0.5f, 12.f);
+    ImVec2 p1(p0.x + w, p0.y + h);
+
+    auto* dl = ImGui::GetBackgroundDrawList();
+    dl->AddRectFilled(p0, p1, IM_COL32(15, 16, 22, 205), h * 0.5f);
+    dl->AddRect(p0, p1, IM_COL32(255, 255, 255, 26), h * 0.5f);
+    if (rec || play) {
+        float pulse = rec ? 0.65f + 0.35f * std::sin(static_cast<float>(ImGui::GetTime()) * 6.f) : 1.f;
+        ImU32 col = rec ? IM_COL32(237, 71, 84, static_cast<int>(pulse * 255.f)) : IM_COL32(51, 199, 133, 255);
+        dl->AddCircleFilled(ImVec2(p0.x + padX + 5.f, p0.y + h * 0.5f), 5.f, col);
+    }
+    dl->AddText(ImVec2(p0.x + padX + dot, p0.y + padY), IM_COL32(240, 242, 247, 255), txt.c_str());
+}
+
+// -------------------------------------------------------------- mod events
+$on_mod(Loaded) {
+    Studio::get().loadSettings();
     ImGuiCocos::get().setup([] {
-        // default Dear ImGui dark style + default font, same look as the screenshot
+        applyStyle();
     }).draw([] {
-        if (Bot::get().menuOpen) drawWindow();
-        drawHud();
+        if (Studio::get().menuOpen) drawWindow();
+        drawOverlay();
     });
 }
 
-// ----------------------------------------------------------------- hooks
-class $modify(RaptorBaseGameLayer, GJBaseGameLayer) {
-        void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        if (!isHalfTick) Bot::get().beginStep(this);
+$on_mod(DataSaved) {
+    Studio::get().saveSettings();
+}
+
+$on_mod(Disabled) {
+    CCDirector::get()->getScheduler()->setTimeScale(1.f);
+}
+
+// ------------------------------------------------------------------- hooks
+class $modify(StudioBaseGameLayer, GJBaseGameLayer) {
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+        if (!isHalfTick) Studio::get().beginStep(this);
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
-        if (!Bot::get().onPlayerInput(this, down, button, isPlayer1)) return;
+        if (!Studio::get().onInput(this, down, button, isPlayer1)) return;
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 };
 
-class $modify(RaptorPlayLayer, PlayLayer) {
-    void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (Bot::get().tryRescue(this, object)) return; // death cancelled, rewind pending
-        PlayLayer::destroyPlayer(player, object);
-    }
-
+class $modify(StudioPlayLayer, PlayLayer) {
     void resetLevel() {
         PlayLayer::resetLevel();
-        Bot::get().onLevelReset(this);
+        Studio::get().onLevelReset(this);
     }
 
     void onQuit() {
-        Bot::get().clearRun(); // release checkpoints before the layer goes away
+        Studio::get().onQuit();
         PlayLayer::onQuit();
+    }
+
+    void levelComplete() {
+        Studio::get().onComplete();
+        PlayLayer::levelComplete();
+    }
+
+    CheckpointObject* createCheckpoint() {
+        auto* cp = PlayLayer::createCheckpoint();
+        Studio::get().onCheckpoint(cp);
+        return cp;
+    }
+
+    void loadFromCheckpoint(CheckpointObject* cp) {
+        PlayLayer::loadFromCheckpoint(cp);
+        Studio::get().onCheckpointLoad(cp);
     }
 };
 
-class $modify(RaptorKeys, CCKeyboardDispatcher) {
-    // If your bindings declare dispatchKeyboardMSG without the trailing double, drop it.
+class $modify(StudioKeys, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(enumKeyCodes key, bool down, bool repeat, double timestamp) {
         bool typing = ImGui::GetCurrentContext() && ImGui::GetIO().WantTextInput;
-        if (down && !repeat && !typing) {
-            auto& b = Bot::get();
-            if (key == kKeyLiveplay) {
-                b.setMode(b.mode == Mode::Liveplay ? Mode::Disabled : Mode::Liveplay);
-                Notification::create(
-                    b.mode == Mode::Liveplay ? "Raptor Bot: Liveplay ON" : "Raptor Bot: Liveplay OFF",
-                    NotificationIcon::Success, 0.8f
-                )->show();
-            } else if (key == kKeyMenu) {
-                b.menuOpen = !b.menuOpen;
-            }
+        if (down && !repeat && !typing && key == kKeyMenu) {
+            auto& s = Studio::get();
+            s.menuOpen = !s.menuOpen;
+            return true; // swallow P so the game doesn't also react to it
         }
         return CCKeyboardDispatcher::dispatchKeyboardMSG(key, down, repeat, timestamp);
     }

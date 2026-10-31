@@ -6,9 +6,9 @@
         "mac": "2.2081",
         "ios": "2.2081"
     },
-    "id": "oouushii.raptorbot",
-    "name": "Raptor Bot",
+    "id": "oouushii.macrostudio",
+    "name": "Macro Studio",
     "version": "v1.0.0",
     "developer": "oouushii",
-    "description": "Liveplay assist using gdr2 replays."
+    "description": "Macro recorder and player with a modern menu. Press P to open it."
 }

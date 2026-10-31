@@ -604,9 +604,7 @@ $on_mod(DataSaved) {
     Studio::get().saveSettings();
 }
 
-$on_mod(Disabled) {
-    CCDirector::get()->getScheduler()->setTimeScale(1.f);
-}
+
 
 // ------------------------------------------------------------------- hooks
 class $modify(StudioBaseGameLayer, GJBaseGameLayer) {

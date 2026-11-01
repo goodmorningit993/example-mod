@@ -74,6 +74,15 @@ struct Studio {
     bool injecting = false;
     std::unordered_map<CheckpointObject*, uint64_t> cpFrames;
 
+    // Frame the current physics step started on. Inputs are stamped with this so
+    // recording and playback always use the same frame numbers.
+    uint64_t stepFrame = 0;
+    bool inStep = false;
+    // Playback cursor: next macro input that has not been injected yet.
+    size_t playIdx = 0;
+    uint64_t lastPlayFrame = 0;
+    std::string lastInput = "-";
+
     static Studio& get() {
         static Studio s;
         return s;
@@ -84,6 +93,13 @@ struct Studio {
         auto* pl = PlayLayer::get();
         if (!pl) return 0;
         return static_cast<uint64_t>(std::max(0, static_cast<int>(pl->m_gameState.m_currentProgress)));
+    }
+
+    uint64_t curFrame() const { return inStep ? stepFrame : frame(); }
+
+    void rewindPlayback() {
+        playIdx = 0;
+        lastPlayFrame = UINT64_MAX; // forces the cursor to be recomputed on the next step
     }
 
     static bool isPlayLayer(GJBaseGameLayer* gl) {
@@ -203,6 +219,7 @@ struct Studio {
             return;
         }
         macro = r.unwrap();
+        rewindPlayback();
         // GDR2 stores P1 inputs then P2 inputs, so sort after importing.
         std::stable_sort(macro.inputs.begin(), macro.inputs.end(),
             [](MInput const& a, MInput const& b) { return a.frame < b.frame; });
@@ -239,6 +256,7 @@ struct Studio {
 
     void clearMacro() {
         macro = MacroReplay();
+        rewindPlayback();
         status = "Macro cleared";
     }
 
@@ -284,6 +302,7 @@ struct Studio {
             restart();
         } else if (m == Mode::Play) {
             status = "Playing macro";
+            rewindPlayback();
             toast("Playing");
             restart();
         } else if (!wasRecording) {
@@ -297,27 +316,47 @@ struct Studio {
         if (injecting || !isPlayLayer(gl)) return true;
         if (mode == Mode::Play) return !ignoreInput;
         if (mode == Mode::Record) {
-            macro.inputs.emplace_back(frame(), static_cast<uint8_t>(button), !p1, down);
+            auto f = curFrame();
+            macro.inputs.emplace_back(f, static_cast<uint8_t>(button), !p1, down);
+            lastInput = fmt::format("F {} {} {}", f, down ? "down" : "up", p1 ? "P1" : "P2");
         }
         return true;
     }
 
     // Called at the start of every physics step.
     void beginStep(GJBaseGameLayer* gl) {
-        if (mode != Mode::Play || !isPlayLayer(gl)) return;
-        auto f = frame();
+        if (!isPlayLayer(gl)) return;
+        stepFrame = frame();
+        inStep = true;
+        if (mode != Mode::Play) return;
+
+        auto f = stepFrame;
         auto& in = macro.inputs;
-        auto it = std::lower_bound(in.begin(), in.end(), f,
-            [](MInput const& a, uint64_t v) { return a.frame < v; });
-        for (; it != in.end() && it->frame == f; ++it) {
-            Injection inj{ f, it->down, static_cast<int>(it->button), !it->player2 };
+
+        // Time went backwards (restart or checkpoint): find where we are in the macro again.
+        if (f < lastPlayFrame) {
+            playIdx = static_cast<size_t>(std::lower_bound(in.begin(), in.end(), f,
+                [](MInput const& a, uint64_t v) { return a.frame < v; }) - in.begin());
+        }
+        lastPlayFrame = f;
+
+        // Catch-up: inject every input that is due, so a skipped frame can never lose one.
+        while (playIdx < in.size() && in[playIdx].frame <= f) {
+            auto const& i = in[playIdx];
             injecting = true;
-            gl->handleButton(inj.down, inj.button, inj.p1);
+            gl->handleButton(i.down, static_cast<int>(i.button), !i.player2);
             injecting = false;
+            ++playIdx;
         }
     }
 
+    void endStep() {
+        inStep = false;
+    }
+
     void onLevelReset(PlayLayer* pl) {
+        inStep = false;
+        rewindPlayback();
         // A restart from the very beginning means a fresh attempt.
         if (!pl->m_isPracticeMode || frame() == 0) {
             cpFrames.clear();
@@ -442,6 +481,8 @@ static void drawMacroTab() {
         stat("Length", fmt::format("{:.1f}s", s.lengthSeconds()));
         ImGui::EndTable();
     }
+
+    ImGui::TextDisabled("Last input: %s", s.lastInput.c_str());
 
     ImGui::Separator();
     if (ImGui::Button("Restart level", ImVec2(-1.f, 36.f))) s.restart();
@@ -604,13 +645,12 @@ $on_mod(DataSaved) {
     Studio::get().saveSettings();
 }
 
-
-
 // ------------------------------------------------------------------- hooks
 class $modify(StudioBaseGameLayer, GJBaseGameLayer) {
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        if (!isHalfTick) Studio::get().beginStep(this);
+        Studio::get().beginStep(this);
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+        Studio::get().endStep();
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {

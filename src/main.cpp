@@ -167,7 +167,8 @@ struct Studio {
     int bitrate = 30;           // Mbps
     bool renderAudio = true;
     float audioVolume = 1.f;
-    float audioOffset = 0.f;    // seconds into the song the video starts at
+    float audioOffset = 0.f;    // extra seconds added on top of the level's own song offset
+    bool autoOffset = true;     // start the music where the level's song offset says
     int endDelay = 3;           // seconds recorded after the level is completed
     bool hideUi = true;
     char ffmpegPath[260] = "ffmpeg";
@@ -295,6 +296,7 @@ struct Studio {
         renderAudio = m->getSavedValue<bool>("r-audio", true);
         audioVolume = m->getSavedValue<float>("r-volume", 1.f);
         audioOffset = m->getSavedValue<float>("r-offset", 0.f);
+        autoOffset = m->getSavedValue<bool>("r-autooffset", true);
         endDelay = std::clamp(m->getSavedValue<int>("r-end", 3), 0, 15);
         hideUi = m->getSavedValue<bool>("r-hideui", true);
         copyStr(ffmpegPath, sizeof(ffmpegPath), m->getSavedValue<std::string>("r-ffmpeg", "ffmpeg"));
@@ -321,6 +323,7 @@ struct Studio {
         m->setSavedValue("r-audio", renderAudio);
         m->setSavedValue("r-volume", audioVolume);
         m->setSavedValue("r-offset", audioOffset);
+        m->setSavedValue("r-autooffset", autoOffset);
         m->setSavedValue("r-end", endDelay);
         m->setSavedValue("r-hideui", hideUi);
         m->setSavedValue("r-ffmpeg", std::string(ffmpegPath));
@@ -344,6 +347,7 @@ struct Studio {
         renderAudio = true;
         audioVolume = 1.f;
         audioOffset = 0.f;
+        autoOffset = true;
         endDelay = 3;
         hideUi = true;
         copyStr(ffmpegPath, sizeof(ffmpegPath), "ffmpeg");
@@ -577,7 +581,7 @@ struct Studio {
 
 #ifdef GEODE_IS_WINDOWS
     std::wstring buildCommand(int fps, int ow, int oh, std::filesystem::path const& out,
-                              std::filesystem::path const& audio) const {
+                              std::filesystem::path const& audio, float offsetSec) const {
         auto q = [](std::wstring const& s) { return L"\"" + s + L"\""; };
         auto num = [](char const* fmtStr, double v) {
             char buf[32];
@@ -593,8 +597,8 @@ struct Studio {
 
         bool withAudio = !audio.empty();
         if (withAudio) {
-            c += audioOffset >= 0.f ? L" -ss " : L" -itsoffset ";
-            c += num("%.3f", std::abs(audioOffset)) + L" -i " + q(audio.wstring());
+            c += offsetSec >= 0.f ? L" -ss " : L" -itsoffset ";
+            c += num("%.3f", std::abs(offsetSec)) + L" -i " + q(audio.wstring());
         }
 
         // OpenGL frames are upside down, so flip, then fit into the output size.
@@ -655,7 +659,12 @@ struct Studio {
         std::filesystem::path audio;
         if (renderAudio) audio = resolveAudio();
 
-        auto cmd = buildCommand(fps, ow, oh, outPath, audio);
+        // The level's own song start time (the Song Offset in the level settings) plus your fine-tuning.
+        // A custom audio file is used as-is, so only your own offset applies to it.
+        float offsetSec = audioOffset;
+        if (autoOffset && audioPath[0] == '\0' && pl->m_levelSettings) offsetSec += pl->m_levelSettings->m_songOffset;
+
+        auto cmd = buildCommand(fps, ow, oh, outPath, audio, offsetSec);
 
         SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
         HANDLE rd = nullptr;
@@ -701,7 +710,9 @@ struct Studio {
 
         mode = Mode::Play;
         rewindPlayback();
-        status = audio.empty() && renderAudio ? "Rendering (no audio file found)" : "Rendering";
+        if (!renderAudio) status = "Rendering (no audio)";
+        else if (audio.empty()) status = "Rendering (no audio file found)";
+        else status = fmt::format("Rendering (music starts at {:.2f}s)", offsetSec);
         restart();
 #else
         status = "Rendering is only available on Windows";
@@ -1049,8 +1060,13 @@ static void drawRenderTab() {
     ImGui::Checkbox("Add level music", &s.renderAudio);
     if (s.renderAudio) {
         ImGui::SliderFloat("Volume", &s.audioVolume, 0.f, 2.f, "%.2fx");
-        ImGui::SliderFloat("Song offset", &s.audioOffset, -10.f, 60.f, "%.2f s");
-        tip("Where in the song the video starts. Use it if the music is out of sync.");
+        ImGui::Checkbox("Use level song offset", &s.autoOffset);
+        tip("Starts the music where the level starts it (the Song Offset set in the level editor).");
+        if (auto* pl = PlayLayer::get()) {
+            if (pl->m_levelSettings) ImGui::TextDisabled("This level starts its song at %.2f s", pl->m_levelSettings->m_songOffset);
+        }
+        ImGui::SliderFloat("Extra offset", &s.audioOffset, -10.f, 60.f, "%.2f s");
+        tip("Fine-tune on top of the level offset. Use it if the music is slightly out of sync.");
         ImGui::InputText("Audio file", s.audioPath, sizeof(s.audioPath));
         tip("Optional. Leave empty to use the level's own song.");
     }

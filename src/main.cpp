@@ -1,28 +1,39 @@
-// Macro Studio - macro recorder / player for Geometry Dash (Geode)
+// Macro Studio - macro recorder / player / video renderer for Geometry Dash (Geode)
 //
 // Press P to open or close the menu.
 //   Record : saves every click/release (both players, platformer buttons) per physics frame
 //   Play   : replays the macro by injecting those inputs on the exact frames
+//   Render : plays the macro at a fixed frame rate and pipes every frame to FFmpeg (Windows)
 // Macros are stored as .gdr2 files in the mod's config folder (macros/).
+// Videos are written to the renders/ folder next to it.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
+#include <Geode/modify/CCScheduler.hpp>
+#include <Geode/modify/CCEGLView.hpp>
 #include <Geode/utils/file.hpp>
 #include <imgui-cocos.hpp>
 #include <gdr/gdr.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <ctime>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
+
+#ifdef GEODE_IS_WINDOWS
+#include <windows.h>
+#endif
 
 using namespace geode::prelude;
 
 // ---------------------------------------------------------------- keybind
-static constexpr enumKeyCodes kKeyMenu = KEY_P;   // opens / closes the menu
+static constexpr enumKeyCodes kKeyMenu = KEY_P;   // opens / closes the menu (stops a render)
 
 // ------------------------------------------------------------ macro types
 using MInput = gdr::Input<>;
@@ -32,14 +43,17 @@ struct MacroReplay : gdr::Replay<MacroReplay, MInput> {
 };
 
 enum class Mode { Idle, Record, Play };
-enum class Tab { Macro, Settings, Library };
+enum class Tab { Macro, Render, Settings, Library };
 
-struct Injection {
-    uint64_t frame;
-    bool down;
-    int button;
-    bool p1;
-};
+// ------------------------------------------------------------ render options
+static char const* kResNames[] = {"Match window", "1280 x 720", "1920 x 1080", "2560 x 1440", "3840 x 2160"};
+static int const kResW[] = {0, 1280, 1920, 2560, 3840};
+static int const kResH[] = {0, 720, 1080, 1440, 2160};
+static char const* kFpsNames[] = {"30 FPS", "60 FPS", "120 FPS", "240 FPS"};
+static int const kFpsV[] = {30, 60, 120, 240};
+static char const* kCodecNames[] = {"H.264 (CPU)", "H.265 (CPU)", "H.264 (NVIDIA)", "H.264 (AMD)", "H.264 (Intel)"};
+static char const* kCodecLib[] = {"libx264", "libx265", "h264_nvenc", "h264_amf", "h264_qsv"};
+static char const* kPresetNames[] = {"ultrafast", "veryfast", "fast", "medium", "slow"};
 
 // ------------------------------------------------------------------ colors
 static ImVec4 const kAccent(0.47f, 0.36f, 0.98f, 1.f);
@@ -48,13 +62,95 @@ static ImVec4 const kGreen(0.20f, 0.78f, 0.52f, 1.f);
 static ImVec4 const kCard(0.14f, 0.15f, 0.19f, 1.f);
 static ImVec4 const kCardHover(0.20f, 0.21f, 0.27f, 1.f);
 
+// ------------------------------------------------------------ text helpers
+#ifdef GEODE_IS_WINDOWS
+static std::wstring toWide(std::string const& s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    if (n <= 1) return {};
+    std::wstring w(static_cast<size_t>(n - 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+    return w;
+}
+
+static std::string toUtf8(std::wstring const& w) {
+    if (w.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return {};
+    std::string s(static_cast<size_t>(n - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, s.data(), n, nullptr, nullptr);
+    return s;
+}
+#endif
+
+static std::filesystem::path fromUtf8(std::string const& s) {
+#ifdef GEODE_IS_WINDOWS
+    return std::filesystem::path(toWide(s));
+#else
+    return std::filesystem::path(s);
+#endif
+}
+
+static std::string pathToUtf8(std::filesystem::path const& p) {
+#ifdef GEODE_IS_WINDOWS
+    return toUtf8(p.wstring());
+#else
+    return p.string();
+#endif
+}
+
+#ifdef GEODE_IS_WINDOWS
+static bool writeAll(HANDLE h, uint8_t const* p, size_t n) {
+    while (n > 0) {
+        DWORD chunk = static_cast<DWORD>(std::min<size_t>(n, 1u << 20));
+        DWORD written = 0;
+        if (!WriteFile(h, p, chunk, &written, nullptr) || written == 0) return false;
+        p += written;
+        n -= written;
+    }
+    return true;
+}
+
+// Runs a command with no window and waits for it. Returns the exit code, or -1 if it can't start.
+static int runQuiet(std::wstring cmd, DWORD timeoutMs) {
+    SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
+    HANDLE nul = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        &sa, OPEN_EXISTING, 0, nullptr);
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = nul;
+    si.hStdOutput = nul;
+    si.hStdError = nul;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+        return -1;
+    }
+    DWORD code = 1;
+    if (WaitForSingleObject(pi.hProcess, timeoutMs) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+    else TerminateProcess(pi.hProcess, 1);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+    return static_cast<int>(code);
+}
+#endif
+
+struct Injection {
+    uint64_t frame;
+    bool down;
+    int button;
+    bool p1;
+};
+
 // ------------------------------------------------------------------- state
 struct Studio {
     Mode mode = Mode::Idle;
     Tab tab = Tab::Macro;
     bool menuOpen = false;
 
-    // settings (saved between sessions)
+    // general settings (saved between sessions)
     bool autoSave = true;
     bool practiceFix = true;
     bool ignoreInput = true;
@@ -62,6 +158,21 @@ struct Studio {
     bool overlayDetails = true;
     bool notify = true;
     float speed = 1.f;
+
+    // render settings (saved between sessions)
+    int resIdx = 0;
+    int fpsIdx = 1;
+    int codecIdx = 0;
+    int presetIdx = 3;
+    int bitrate = 30;           // Mbps
+    bool renderAudio = true;
+    float audioVolume = 1.f;
+    float audioOffset = 0.f;    // seconds into the song the video starts at
+    int endDelay = 3;           // seconds recorded after the level is completed
+    bool hideUi = true;
+    char ffmpegPath[260] = "ffmpeg";
+    char outDir[260] = "";
+    char audioPath[260] = "";
 
     // runtime
     MacroReplay macro;
@@ -82,6 +193,23 @@ struct Studio {
     size_t playIdx = 0;
     uint64_t lastPlayFrame = 0;
     std::string lastInput = "-";
+
+    // render runtime
+    bool rendering = false;
+    bool deathStop = false;
+    uint64_t renderedFrames = 0;
+    uint64_t endAtFrame = 0;
+    int capW = 0;
+    int capH = 0;
+    std::vector<uint8_t> pixels;
+    std::string renderFile;
+    std::string ffmpegInfo = "Not checked yet";
+    std::chrono::steady_clock::time_point renderStart;
+#ifdef GEODE_IS_WINDOWS
+    HANDLE pipeIn = nullptr;
+    HANDLE logH = nullptr;
+    PROCESS_INFORMATION pi{};
+#endif
 
     static Studio& get() {
         static Studio s;
@@ -122,6 +250,10 @@ struct Studio {
         return d;
     }
 
+    std::filesystem::path defaultRenderDir() const {
+        return Mod::get()->getConfigDir() / "renders";
+    }
+
     void toast(std::string const& msg) const {
         if (notify) Notification::create(msg, NotificationIcon::Success, 0.8f)->show();
     }
@@ -136,6 +268,14 @@ struct Studio {
         return static_cast<float>(macro.inputs.back().frame / macro.framerate);
     }
 
+    uint64_t lastMacroFrame() const {
+        return macro.inputs.empty() ? 0 : macro.inputs.back().frame;
+    }
+
+    static void copyStr(char* dst, size_t cap, std::string const& src) {
+        std::snprintf(dst, cap, "%s", src.c_str());
+    }
+
     // ----------------------------------------------------------- settings
     void loadSettings() {
         auto* m = Mod::get();
@@ -146,6 +286,20 @@ struct Studio {
         overlayDetails = m->getSavedValue<bool>("overlay-details", true);
         notify = m->getSavedValue<bool>("notify", true);
         speed = m->getSavedValue<float>("speed", 1.f);
+
+        resIdx = std::clamp(m->getSavedValue<int>("r-res", 0), 0, 4);
+        fpsIdx = std::clamp(m->getSavedValue<int>("r-fps", 1), 0, 3);
+        codecIdx = std::clamp(m->getSavedValue<int>("r-codec", 0), 0, 4);
+        presetIdx = std::clamp(m->getSavedValue<int>("r-preset", 3), 0, 4);
+        bitrate = std::clamp(m->getSavedValue<int>("r-bitrate", 30), 1, 150);
+        renderAudio = m->getSavedValue<bool>("r-audio", true);
+        audioVolume = m->getSavedValue<float>("r-volume", 1.f);
+        audioOffset = m->getSavedValue<float>("r-offset", 0.f);
+        endDelay = std::clamp(m->getSavedValue<int>("r-end", 3), 0, 15);
+        hideUi = m->getSavedValue<bool>("r-hideui", true);
+        copyStr(ffmpegPath, sizeof(ffmpegPath), m->getSavedValue<std::string>("r-ffmpeg", "ffmpeg"));
+        copyStr(outDir, sizeof(outDir), m->getSavedValue<std::string>("r-outdir", pathToUtf8(defaultRenderDir())));
+        copyStr(audioPath, sizeof(audioPath), m->getSavedValue<std::string>("r-audiopath", ""));
         applySpeed();
     }
 
@@ -158,12 +312,43 @@ struct Studio {
         m->setSavedValue("overlay-details", overlayDetails);
         m->setSavedValue("notify", notify);
         m->setSavedValue("speed", speed);
+
+        m->setSavedValue("r-res", resIdx);
+        m->setSavedValue("r-fps", fpsIdx);
+        m->setSavedValue("r-codec", codecIdx);
+        m->setSavedValue("r-preset", presetIdx);
+        m->setSavedValue("r-bitrate", bitrate);
+        m->setSavedValue("r-audio", renderAudio);
+        m->setSavedValue("r-volume", audioVolume);
+        m->setSavedValue("r-offset", audioOffset);
+        m->setSavedValue("r-end", endDelay);
+        m->setSavedValue("r-hideui", hideUi);
+        m->setSavedValue("r-ffmpeg", std::string(ffmpegPath));
+        m->setSavedValue("r-outdir", std::string(outDir));
+        m->setSavedValue("r-audiopath", std::string(audioPath));
     }
 
     void resetSettings() {
         autoSave = practiceFix = ignoreInput = overlay = overlayDetails = notify = true;
         speed = 1.f;
         applySpeed();
+        resetRenderSettings();
+    }
+
+    void resetRenderSettings() {
+        resIdx = 0;
+        fpsIdx = 1;
+        codecIdx = 0;
+        presetIdx = 3;
+        bitrate = 30;
+        renderAudio = true;
+        audioVolume = 1.f;
+        audioOffset = 0.f;
+        endDelay = 3;
+        hideUi = true;
+        copyStr(ffmpegPath, sizeof(ffmpegPath), "ffmpeg");
+        copyStr(outDir, sizeof(outDir), pathToUtf8(defaultRenderDir()));
+        audioPath[0] = '\0';
     }
 
     // ------------------------------------------------------- file handling
@@ -208,6 +393,10 @@ struct Studio {
     }
 
     void load(std::filesystem::path const& p) {
+        if (rendering) {
+            status = "Stop the render first";
+            return;
+        }
         auto bytes = utils::file::readBinary(p);
         if (bytes.isErr()) {
             status = "Load failed: " + bytes.unwrapErr();
@@ -255,6 +444,10 @@ struct Studio {
     }
 
     void clearMacro() {
+        if (rendering) {
+            status = "Stop the render first";
+            return;
+        }
         macro = MacroReplay();
         rewindPlayback();
         status = "Macro cleared";
@@ -284,6 +477,10 @@ struct Studio {
     }
 
     void setMode(Mode m) {
+        if (rendering) {
+            status = "Stop the render first";
+            return;
+        }
         if (m == mode) m = Mode::Idle; // clicking the active mode turns it off
         bool wasRecording = mode == Mode::Record && m != Mode::Record;
         if (wasRecording) finishRecording();
@@ -310,11 +507,302 @@ struct Studio {
         }
     }
 
+    // ------------------------------------------------------------ rendering
+    bool renderSupported() const {
+#ifdef GEODE_IS_WINDOWS
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    // Looks for FFmpeg: the saved path first, then the mod folder, then the system PATH.
+    void detectFfmpeg() {
+#ifdef GEODE_IS_WINDOWS
+        auto works = [](std::string const& path) {
+            return runQuiet(L"\"" + toWide(path) + L"\" -version", 5000) == 0;
+        };
+        if (works(ffmpegPath)) {
+            ffmpegInfo = "FFmpeg found";
+            return;
+        }
+        std::vector<std::filesystem::path> candidates = {
+            Mod::get()->getConfigDir() / "ffmpeg" / "ffmpeg.exe",
+            Mod::get()->getConfigDir() / "ffmpeg.exe",
+            Mod::get()->getConfigDir() / "ffmpeg" / "bin" / "ffmpeg.exe",
+        };
+        for (auto const& c : candidates) {
+            std::error_code ec;
+            if (!std::filesystem::exists(c, ec)) continue;
+            auto s = pathToUtf8(c);
+            if (works(s)) {
+                copyStr(ffmpegPath, sizeof(ffmpegPath), s);
+                ffmpegInfo = "FFmpeg found in the mod folder";
+                return;
+            }
+        }
+        if (works("ffmpeg")) {
+            copyStr(ffmpegPath, sizeof(ffmpegPath), "ffmpeg");
+            ffmpegInfo = "FFmpeg found on your PATH";
+            return;
+        }
+        ffmpegInfo = "FFmpeg not found. Put ffmpeg.exe in the mod folder or set its path below.";
+#else
+        ffmpegInfo = "Rendering is only available on Windows";
+#endif
+    }
+
+    // Works out which audio file to mix into the video (empty = no audio).
+    std::filesystem::path resolveAudio() const {
+        std::error_code ec;
+        if (audioPath[0] != '\0') {
+            auto p = fromUtf8(audioPath);
+            return std::filesystem::exists(p, ec) ? p : std::filesystem::path{};
+        }
+        auto* pl = PlayLayer::get();
+        if (!pl || !pl->m_level) return {};
+        auto* lvl = pl->m_level;
+
+        std::string file;
+        if (lvl->m_songID > 0) file = std::string(MusicDownloadManager::sharedState()->pathForSong(lvl->m_songID));
+        else file = std::string(LevelTools::getAudioFileName(lvl->m_audioTrack));
+        if (file.empty()) return {};
+
+        auto p = fromUtf8(file);
+        if (std::filesystem::exists(p, ec)) return p;
+        std::string full = CCFileUtils::sharedFileUtils()->fullPathForFilename(file.c_str(), false);
+        p = fromUtf8(full);
+        return std::filesystem::exists(p, ec) ? p : std::filesystem::path{};
+    }
+
+#ifdef GEODE_IS_WINDOWS
+    std::wstring buildCommand(int fps, int ow, int oh, std::filesystem::path const& out,
+                              std::filesystem::path const& audio) const {
+        auto q = [](std::wstring const& s) { return L"\"" + s + L"\""; };
+        auto num = [](char const* fmtStr, double v) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), fmtStr, v);
+            return toWide(buf);
+        };
+        std::wstring W = std::to_wstring(ow);
+        std::wstring H = std::to_wstring(oh);
+
+        std::wstring c = q(toWide(ffmpegPath)) + L" -y -hide_banner -loglevel warning";
+        c += L" -f rawvideo -pix_fmt rgba -s " + std::to_wstring(capW) + L"x" + std::to_wstring(capH);
+        c += L" -r " + std::to_wstring(fps) + L" -i -";
+
+        bool withAudio = !audio.empty();
+        if (withAudio) {
+            c += audioOffset >= 0.f ? L" -ss " : L" -itsoffset ";
+            c += num("%.3f", std::abs(audioOffset)) + L" -i " + q(audio.wstring());
+        }
+
+        // OpenGL frames are upside down, so flip, then fit into the output size.
+        c += L" -vf " + q(L"vflip,scale=" + W + L":" + H +
+            L":force_original_aspect_ratio=decrease:flags=lanczos,pad=" + W + L":" + H +
+            L":(ow-iw)/2:(oh-ih)/2");
+
+        c += L" -c:v " + toWide(kCodecLib[codecIdx]);
+        if (codecIdx <= 1) c += L" -preset " + toWide(kPresetNames[presetIdx]);
+        if (codecIdx == 1) c += L" -tag:v hvc1";
+        c += L" -b:v " + std::to_wstring(bitrate) + L"M -pix_fmt yuv420p";
+
+        if (withAudio) {
+            c += L" -map 0:v -map 1:a -af volume=" + num("%.2f", audioVolume);
+            c += L" -c:a aac -b:a 192k -shortest";
+        }
+        c += L" -movflags +faststart " + q(out.wstring());
+        return c;
+    }
+#endif
+
+    void startRender() {
+#ifdef GEODE_IS_WINDOWS
+        if (rendering) return;
+        auto* pl = PlayLayer::get();
+        if (!pl) {
+            status = "Open a level first";
+            return;
+        }
+        if (macro.inputs.empty()) {
+            status = "Load or record a macro first";
+            return;
+        }
+        if (mode == Mode::Record) finishRecording();
+
+        auto sz = CCEGLView::get()->getFrameSize();
+        capW = static_cast<int>(sz.width);
+        capH = static_cast<int>(sz.height);
+        if (capW < 16 || capH < 16) {
+            status = "The game window is too small to capture";
+            return;
+        }
+
+        int fps = kFpsV[fpsIdx];
+        int ow = kResW[resIdx];
+        int oh = kResH[resIdx];
+        if (ow == 0) {
+            ow = capW & ~1;
+            oh = capH & ~1;
+        }
+
+        auto outFolder = fromUtf8(outDir);
+        if (outFolder.empty()) outFolder = defaultRenderDir();
+        std::error_code ec;
+        std::filesystem::create_directories(outFolder, ec);
+        auto outPath = outFolder / (autoName() + ".mp4");
+
+        std::filesystem::path audio;
+        if (renderAudio) audio = resolveAudio();
+
+        auto cmd = buildCommand(fps, ow, oh, outPath, audio);
+
+        SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
+        HANDLE rd = nullptr;
+        HANDLE wr = nullptr;
+        if (!CreatePipe(&rd, &wr, &sa, 1 << 20)) {
+            status = "Could not create the video pipe";
+            return;
+        }
+        SetHandleInformation(wr, HANDLE_FLAG_INHERIT, 0); // the child must only inherit the read end
+
+        auto logPath = Mod::get()->getConfigDir() / "render.log";
+        logH = CreateFileW(logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = rd;
+        si.hStdOutput = logH == INVALID_HANDLE_VALUE ? nullptr : logH;
+        si.hStdError = logH == INVALID_HANDLE_VALUE ? nullptr : logH;
+        pi = {};
+        bool ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+            nullptr, nullptr, &si, &pi) != 0;
+        CloseHandle(rd);
+        if (!ok) {
+            CloseHandle(wr);
+            if (logH != INVALID_HANDLE_VALUE && logH) CloseHandle(logH);
+            logH = nullptr;
+            status = "Could not start FFmpeg. Check the FFmpeg path on the Render tab.";
+            return;
+        }
+        pipeIn = wr;
+
+        renderFile = outPath.filename().string();
+        renderedFrames = 0;
+        endAtFrame = 0;
+        deathStop = false;
+        renderStart = std::chrono::steady_clock::now();
+        rendering = true;
+
+        CCDirector::get()->getScheduler()->setTimeScale(1.f); // the render uses its own fixed time step
+        if (hideUi) menuOpen = false;
+
+        mode = Mode::Play;
+        rewindPlayback();
+        status = audio.empty() && renderAudio ? "Rendering (no audio file found)" : "Rendering";
+        restart();
+#else
+        status = "Rendering is only available on Windows";
+#endif
+    }
+
+    void stopRender(std::string const& reason, bool failed) {
+#ifdef GEODE_IS_WINDOWS
+        if (!rendering) return;
+        rendering = false;
+        applySpeed();
+
+        if (pipeIn) {
+            CloseHandle(pipeIn); // tells FFmpeg the video is over
+            pipeIn = nullptr;
+        }
+        auto proc = pi;
+        auto log = logH;
+        pi = {};
+        logH = nullptr;
+        auto file = renderFile;
+        auto frames = renderedFrames;
+        status = failed ? reason : "Finishing the video...";
+        menuOpen = true;
+
+        std::thread([proc, log, file, frames, reason, failed]() {
+            DWORD code = 1;
+            if (WaitForSingleObject(proc.hProcess, 120000) == WAIT_OBJECT_0) GetExitCodeProcess(proc.hProcess, &code);
+            else TerminateProcess(proc.hProcess, 1);
+            CloseHandle(proc.hProcess);
+            CloseHandle(proc.hThread);
+            if (log && log != INVALID_HANDLE_VALUE) CloseHandle(log);
+            Loader::get()->queueInMainThread([code, file, frames, reason, failed]() {
+                Studio::get().onRenderFinished(code == 0 && !failed, file, frames, reason);
+            });
+        }).detach();
+#else
+        (void)reason;
+        (void)failed;
+#endif
+    }
+
+    void onRenderFinished(bool ok, std::string const& file, uint64_t frames, std::string const& reason) {
+        std::string msg;
+        if (ok) msg = fmt::format("Render saved: {} ({} frames)", file, frames);
+        else if (reason.empty() || reason == "Stopped by user") msg = "FFmpeg reported an error. Open the mod folder and read render.log";
+        else msg = "Render failed: " + reason;
+        status = msg;
+        Notification::create(msg, ok ? NotificationIcon::Success : NotificationIcon::Error, 3.f)->show();
+    }
+
+    // Called from the buffer-swap hook once per displayed frame.
+    void captureFrame() {
+#ifdef GEODE_IS_WINDOWS
+        if (!rendering || !pipeIn) return;
+        if (!PlayLayer::get()) {
+            stopRender("Left the level", false);
+            return;
+        }
+
+        auto sz = CCEGLView::get()->getFrameSize();
+        int w = static_cast<int>(sz.width);
+        int h = static_cast<int>(sz.height);
+        if (w != capW || h != capH) {
+            stopRender("The game window changed size during the render", true);
+            return;
+        }
+
+        pixels.resize(static_cast<size_t>(w) * static_cast<size_t>(h) * 4);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+        if (!writeAll(pipeIn, pixels.data(), pixels.size())) {
+            stopRender("FFmpeg stopped unexpectedly. Check render.log", true);
+            return;
+        }
+        ++renderedFrames;
+
+        int fps = kFpsV[fpsIdx];
+        // Safety net: macro ended long ago and the level never finished.
+        if (!endAtFrame && frame() > lastMacroFrame() + static_cast<uint64_t>(120.0 * std::max(1.0, static_cast<double>(macro.framerate)))) {
+            endAtFrame = renderedFrames;
+        }
+        if (endAtFrame && renderedFrames >= endAtFrame) {
+            stopRender(deathStop ? "Player died during the render" : "Render finished", false);
+        }
+        (void)fps;
+#endif
+    }
+
+    void onDeath() {
+        if (!rendering || endAtFrame) return;
+        deathStop = true;
+        endAtFrame = renderedFrames + static_cast<uint64_t>(kFpsV[fpsIdx]); // keep 1 second of the death
+        status = "Player died: finishing the render";
+    }
+
     // --------------------------------------------------- game-side events
     // Returns false to drop the input.
     bool onInput(GJBaseGameLayer* gl, bool down, int button, bool p1) {
         if (injecting || !isPlayLayer(gl)) return true;
-        if (mode == Mode::Play) return !ignoreInput;
+        if (mode == Mode::Play) return !(ignoreInput || rendering);
         if (mode == Mode::Record) {
             auto f = curFrame();
             macro.inputs.emplace_back(f, static_cast<uint8_t>(button), !p1, down);
@@ -378,6 +866,13 @@ struct Studio {
     }
 
     void onComplete() {
+        if (rendering) {
+            if (!endAtFrame) {
+                endAtFrame = renderedFrames + static_cast<uint64_t>(endDelay) * static_cast<uint64_t>(kFpsV[fpsIdx]);
+                status = "Level complete: finishing the render";
+            }
+            return;
+        }
         if (mode != Mode::Record) return;
         finishRecording();
         mode = Mode::Idle;
@@ -385,6 +880,7 @@ struct Studio {
     }
 
     void onQuit() {
+        if (rendering) stopRender("Left the level", false);
         if (mode == Mode::Record) {
             finishRecording();
             mode = Mode::Idle;
@@ -427,6 +923,7 @@ static void applyStyle() {
     c[ImGuiCol_CheckMark] = kAccent;
     c[ImGuiCol_SliderGrab] = kAccent;
     c[ImGuiCol_SliderGrabActive] = ImVec4(0.60f, 0.50f, 1.f, 1.f);
+    c[ImGuiCol_PlotHistogram] = kAccent;
     c[ImGuiCol_Header] = ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.30f);
     c[ImGuiCol_HeaderHovered] = ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.50f);
     c[ImGuiCol_HeaderActive] = ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.70f);
@@ -497,6 +994,92 @@ static void drawMacroTab() {
         ImGui::Spacing();
         ImGui::TextDisabled("No macro loaded. Record one, or open the Library tab.");
     }
+}
+
+static void drawRenderTab() {
+    auto& s = Studio::get();
+
+    if (!s.renderSupported()) {
+        ImGui::TextWrapped("Rendering is only available on Windows.");
+        return;
+    }
+
+    // While a render is running, show progress instead of settings.
+    if (s.rendering) {
+        double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - s.renderStart).count();
+        double videoSec = static_cast<double>(s.renderedFrames) / kFpsV[s.fpsIdx];
+        float frac = s.endAtFrame
+            ? 1.f
+            : std::clamp(static_cast<float>(s.frame()) / static_cast<float>(s.lastMacroFrame() + 1), 0.f, 1.f);
+
+        ImGui::TextColored(kRed, "Rendering...");
+        ImGui::ProgressBar(frac, ImVec2(-1.f, 0.f));
+        ImGui::Text("Frames: %llu    Video: %.1fs    Elapsed: %.0fs",
+            static_cast<unsigned long long>(s.renderedFrames), videoSec, elapsed);
+        ImGui::TextDisabled("Speed: %.2fx realtime", elapsed > 0.1 ? videoSec / elapsed : 0.0);
+        ImGui::Spacing();
+        if (coloredButton("Stop render", true, kRed, ImVec2(-1.f, 40.f))) s.stopRender("Stopped by user", false);
+        ImGui::TextDisabled("You can also press P to stop. Don't resize the game window.");
+        return;
+    }
+
+    auto sz = CCEGLView::get()->getFrameSize();
+    float gap = ImGui::GetStyle().ItemSpacing.x;
+    float w2 = (ImGui::GetContentRegionAvail().x - gap) / 2.f;
+
+    ImGui::BeginDisabled(s.macro.inputs.empty());
+    if (coloredButton("Start render", true, kAccent, ImVec2(-1.f, 44.f))) s.startRender();
+    ImGui::EndDisabled();
+    if (s.macro.inputs.empty()) ImGui::TextDisabled("Load or record a macro first (Macro / Library tab).");
+    ImGui::TextDisabled("Captures the game window: %d x %d. Use a bigger window for sharper video.",
+        static_cast<int>(sz.width), static_cast<int>(sz.height));
+    ImGui::TextDisabled("Tip: set the game's music volume to 0 while rendering. Audio is added from the song file.");
+
+    ImGui::SeparatorText("Video");
+    ImGui::Combo("Resolution", &s.resIdx, kResNames, IM_ARRAYSIZE(kResNames));
+    ImGui::Combo("Frame rate", &s.fpsIdx, kFpsNames, IM_ARRAYSIZE(kFpsNames));
+    tip("Should divide the physics rate (240) evenly. 60 is the usual choice.");
+    ImGui::Combo("Encoder", &s.codecIdx, kCodecNames, IM_ARRAYSIZE(kCodecNames));
+    tip("NVIDIA / AMD / Intel encoders are much faster if you have that graphics card.");
+    if (s.codecIdx <= 1) ImGui::Combo("Preset", &s.presetIdx, kPresetNames, IM_ARRAYSIZE(kPresetNames));
+    ImGui::SliderInt("Bitrate", &s.bitrate, 1, 150, "%d Mbps");
+    tip("Higher = better quality and bigger files. 20-40 is good for 1080p60.");
+
+    ImGui::SeparatorText("Audio");
+    ImGui::Checkbox("Add level music", &s.renderAudio);
+    if (s.renderAudio) {
+        ImGui::SliderFloat("Volume", &s.audioVolume, 0.f, 2.f, "%.2fx");
+        ImGui::SliderFloat("Song offset", &s.audioOffset, -10.f, 60.f, "%.2f s");
+        tip("Where in the song the video starts. Use it if the music is out of sync.");
+        ImGui::InputText("Audio file", s.audioPath, sizeof(s.audioPath));
+        tip("Optional. Leave empty to use the level's own song.");
+    }
+
+    ImGui::SeparatorText("Output");
+    ImGui::InputText("Folder", s.outDir, sizeof(s.outDir));
+    if (ImGui::Button("Open renders folder", ImVec2(w2, 32.f))) {
+        auto d = fromUtf8(s.outDir);
+        if (d.empty()) d = s.defaultRenderDir();
+        std::error_code ec;
+        std::filesystem::create_directories(d, ec);
+        utils::file::openFolder(d);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Open mod folder", ImVec2(w2, 32.f))) utils::file::openFolder(Mod::get()->getConfigDir());
+    ImGui::SliderInt("End delay", &s.endDelay, 0, 15, "%d s");
+    tip("Seconds kept after the level is completed (the end screen).");
+    ImGui::Checkbox("Hide menu while rendering", &s.hideUi);
+    tip("Keeps the menu out of the video. Press P to stop a render.");
+
+    ImGui::SeparatorText("FFmpeg");
+    ImGui::InputText("Path", s.ffmpegPath, sizeof(s.ffmpegPath));
+    tip("Full path to ffmpeg.exe, or just 'ffmpeg' if it is on your PATH.");
+    if (ImGui::Button("Detect / test FFmpeg", ImVec2(-1.f, 32.f))) s.detectFfmpeg();
+    ImGui::TextWrapped("%s", s.ffmpegInfo.c_str());
+    ImGui::TextDisabled("Get FFmpeg from gyan.dev (Windows builds) and put ffmpeg.exe in the mod folder.");
+
+    ImGui::Spacing();
+    if (ImGui::Button("Reset render settings", ImVec2(-1.f, 32.f))) s.resetRenderSettings();
 }
 
 static void drawSettingsTab() {
@@ -570,23 +1153,26 @@ static void drawWindow() {
     auto& s = Studio::get();
 
     ImGui::SetNextWindowPos(ImVec2(40.f, 40.f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(400.f, 500.f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(440.f, 560.f), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Macro Studio", nullptr, ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
         return;
     }
 
     float gap = ImGui::GetStyle().ItemSpacing.x;
-    float w3 = (ImGui::GetContentRegionAvail().x - gap * 2.f) / 3.f;
-    tabButton("Macro", Tab::Macro, w3);
+    float w4 = (ImGui::GetContentRegionAvail().x - gap * 3.f) / 4.f;
+    tabButton("Macro", Tab::Macro, w4);
     ImGui::SameLine();
-    tabButton("Settings", Tab::Settings, w3);
+    tabButton("Render", Tab::Render, w4);
     ImGui::SameLine();
-    tabButton("Library", Tab::Library, w3);
+    tabButton("Settings", Tab::Settings, w4);
+    ImGui::SameLine();
+    tabButton("Library", Tab::Library, w4);
     ImGui::Spacing();
 
     switch (s.tab) {
         case Tab::Macro: drawMacroTab(); break;
+        case Tab::Render: drawRenderTab(); break;
         case Tab::Settings: drawSettingsTab(); break;
         case Tab::Library: drawLibraryTab(); break;
     }
@@ -636,8 +1222,10 @@ $on_mod(Loaded) {
     ImGuiCocos::get().setup([] {
         applyStyle();
     }).draw([] {
-        if (Studio::get().menuOpen) drawWindow();
-        drawOverlay();
+        auto& s = Studio::get();
+        bool hidden = s.rendering && s.hideUi; // keep the menu and overlay out of the video
+        if (s.menuOpen && !hidden) drawWindow();
+        if (!hidden) drawOverlay();
     });
 }
 
@@ -675,6 +1263,11 @@ class $modify(StudioPlayLayer, PlayLayer) {
         PlayLayer::levelComplete();
     }
 
+    void destroyPlayer(PlayerObject* player, GameObject* object) {
+        if (object != m_anticheatSpike) Studio::get().onDeath();
+        PlayLayer::destroyPlayer(player, object);
+    }
+
     CheckpointObject* createCheckpoint() {
         auto* cp = PlayLayer::createCheckpoint();
         Studio::get().onCheckpoint(cp);
@@ -687,12 +1280,30 @@ class $modify(StudioPlayLayer, PlayLayer) {
     }
 };
 
+// While rendering, every game frame advances by exactly one video frame.
+class $modify(StudioScheduler, CCScheduler) {
+    void update(float dt) {
+        auto& s = Studio::get();
+        if (s.rendering) dt = 1.f / static_cast<float>(kFpsV[s.fpsIdx]);
+        CCScheduler::update(dt);
+    }
+};
+
+// Grab the finished frame right before it is shown on screen.
+class $modify(StudioView, CCEGLView) {
+    void swapBuffers() {
+        Studio::get().captureFrame();
+        CCEGLView::swapBuffers();
+    }
+};
+
 class $modify(StudioKeys, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(enumKeyCodes key, bool down, bool repeat, double timestamp) {
         bool typing = ImGui::GetCurrentContext() && ImGui::GetIO().WantTextInput;
         if (down && !repeat && !typing && key == kKeyMenu) {
             auto& s = Studio::get();
-            s.menuOpen = !s.menuOpen;
+            if (s.rendering) s.stopRender("Stopped by user", false);
+            else s.menuOpen = !s.menuOpen;
             return true; // swallow P so the game doesn't also react to it
         }
         return CCKeyboardDispatcher::dispatchKeyboardMSG(key, down, repeat, timestamp);

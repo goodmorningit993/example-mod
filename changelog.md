@@ -1,3 +1,8 @@
+# v1.1.1
+
+- Render now starts the music at each level's own song offset automatically.
+- New **Use level song offset** option, and **Extra offset** for fine-tuning.
+
 # v1.1.0
 
 - New **Render** tab: render a macro to an `.mp4` video through FFmpeg.
